@@ -1,0 +1,42 @@
+[project]
+name = "fastapi-1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.139.2",
+    "uvicorn>=0.51.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.22",
+    "taskipy>=1.14.1",
+]
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+preview = true
+select = ['I', 'F', 'E', 'W', 'PL', 'PT']
+
+[tool.ruff.format]
+preview = true
+quote-style = 'single'
+
+[tool.pytest.ini_options]
+pythonpath = '.'
+addopts = '-p no:warnings'
+
+[tool.taskipy.tasks]
+lint = 'ruff check .'
+pre_format = 'ruff check --fix .'
+format = 'ruff format .'
+run = 'uv run uvicorn server.main:app --reload'
+pre_test = 'task lint'
+test = 'pytest -s -x --cov=server -vv'
