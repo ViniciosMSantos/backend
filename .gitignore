@@ -21,3 +21,23 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+#DB
+database.db
+
+### Python ###
+# Variáveis de ambiente / segredos
+.env
+.env.*
+!.env.example
+
+# Ambientes virtuais
+.venv/
+venv/
+
+# Cache do Python / pytest / ruff / coverage
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
