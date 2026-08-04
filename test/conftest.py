@@ -5,7 +5,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
+from server.database.db import get_session
 from server.database.models import table_registry
 from server.main import app
 
@@ -20,7 +22,7 @@ vez e a reutilizamos em qualquer teste que precise fazer requisições à API.
 
 
 @pytest.fixture
-def client():
+def client(session):
     """
     POR QUE ESTA FIXTURE EXISTE:
     Testar rota HTTP sem precisar subir o uvicorn. O TestClient fala
@@ -28,8 +30,33 @@ def client():
     não depende de porta livre nem de servidor rodando.
     Como fixture, qualquer teste que declare `client` no parâmetro
     recebe uma instância nova e isolada automaticamente.
+
+    POR QUE RECEBE `session`:
+    Sem isso as rotas usariam o `get_session` real, ou seja o banco de
+    DESENVOLVIMENTO — o teste sujaria dados de verdade. Declarar
+    `session` como parâmetro faz o pytest montar o SQLite em memória
+    antes deste client existir.
+
+    `app.dependency_overrides[get_session]` é o mecanismo oficial do
+    FastAPI para substituir uma dependência nos testes: onde a rota
+    pedir `Depends(get_session)`, ela recebe a Session de teste. Repare
+    que o override devolve a Session direto (`return`), sem `yield` —
+    quem cuida de fechá-la é a fixture `session`.
+
+    O `.clear()` no fim é obrigatório: dependency_overrides vive no
+    objeto `app`, que é global. Sem limpar, o override vazaria para os
+    testes seguintes.
     """
-    return TestClient(app)
+
+    def get_session_override():
+        return session
+
+    with TestClient(app) as client:
+        app.dependency_overrides[get_session] = get_session_override
+
+        yield client
+
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -42,8 +69,21 @@ def session():
 
     'sqlite:///:memory:' = banco que só existe na RAM; morre junto com
     o processo. Zero arquivo criado no disco.
+
+    OS DOIS ARGUMENTOS EXTRAS existem por causa do TestClient:
+    - poolclass=StaticPool: força o pool a reusar SEMPRE a MESMA
+      conexão. Cada conexão nova para ':memory:' abriria um banco novo
+      e VAZIO — as tabelas criadas aqui simplesmente não existiriam
+      para a rota, e o teste falharia com 'no such table: users'.
+    - check_same_thread=False: o SQLite, por padrão, proíbe usar a
+      conexão fora da thread que a criou. O TestClient roda o app em
+      outra thread, então sem isso o INSERT feito pela rota estouraria.
     """
-    engine = create_engine('sqlite:///:memory:')
+    engine = create_engine(
+        'sqlite:///:memory:',
+        connect_args={'check_same_thread': False},
+        poolclass=StaticPool,
+    )
 
     # Cria as tabelas a partir dos modelos declarados no table_registry.
     # Sem isso o banco em memória estaria vazio e todo INSERT falharia.
@@ -117,6 +157,9 @@ Imports:
     - fastapi.testclient.TestClient: cliente HTTP para testar a API sem
       subir um servidor real.
     - server.main.app: instância da API usada pelo TestClient.
+    - server.database.db.get_session: a dependência REAL de banco, usada
+      aqui como CHAVE do dependency_overrides para ser substituída pela
+      Session de teste.
     - server.database.models.table_registry: registry do ORM para criar as
       tabelas no banco de teste.
     - sqlalchemy.create_engine: cria a conexão (engine) com o banco
@@ -124,6 +167,9 @@ Imports:
     - sqlalchemy.event: registra/remove listeners de eventos do ORM
       (usado para forçar o created_at no 'before_insert').
     - sqlalchemy.orm.Session: sessão do ORM entregue aos testes.
+    - sqlalchemy.pool.StaticPool: pool que reusa uma única conexão —
+      indispensável para o SQLite em memória sobreviver entre a fixture e
+      as requisições feitas pelo TestClient.
     - contextlib.contextmanager: transforma _db_time_fake em um `with`.
     - datetime.datetime: valor padrão do created_at mockado.
 
@@ -131,12 +177,14 @@ Classes:
     Não há classes definidas neste arquivo.
 
 Funções / Fixtures:
-    - client() [fixture]: retorna um TestClient(app) reutilizável para fazer
-      requisições à API nos testes.
-    - session() [fixture]: cria uma engine SQLite em memória, gera as
-      tabelas a partir do metadata do ORM, entrega uma Session ao teste
-      via yield e derruba as tabelas no teardown — garantindo isolamento
-      total entre os testes.
+    - client(session) [fixture]: entrega um TestClient(app) já apontando
+      para o banco de TESTE. Registra `app.dependency_overrides[
+      get_session]` para que as rotas recebam a Session em memória em vez
+      da do banco real, e limpa os overrides no teardown.
+    - session() [fixture]: cria uma engine SQLite em memória (com
+      StaticPool e check_same_thread=False), gera as tabelas a partir do
+      metadata do ORM, entrega uma Session ao teste via yield e derruba as
+      tabelas no teardown — garantindo isolamento total entre os testes.
     - _db_time_fake(model, time): context manager que registra um listener
       no evento 'before_insert' do SQLAlchemy para forçar a coluna
       `created_at` com um valor fixo (`time`), tornando os testes que

@@ -32,21 +32,26 @@ Requisitos: **Python >= 3.13**.
 
 ### Estágio atual do projeto
 
-Os blocos já existem e o **banco real já foi criado**, mas a rota **ainda não
-está ligada a ele**:
+O ciclo está **fechado**: a requisição HTTP entra, é validada, **grava no banco
+real** e volta serializada pelo schema de saída.
 
 | Bloco | Situação |
 |-------|----------|
 | Rotas + schemas (`/auth`) | ✅ funcionando (valida entrada, devolve saída) |
-| Modelo ORM (`User`) | ✅ definido e **testado**, mas só nos testes |
-| Configuração (`Settings`) | ✅ lê o `.env`, mas **nenhum `create_engine` usa** ela |
+| Modelo ORM (`User`) | ✅ definido e **testado** |
+| Configuração (`Settings`) | ✅ lê o `.env` e alimenta a engine em `db.py` |
 | Migrations (Alembic) | ✅ tabela `users` criada no `database.db` (revisão `3561799945aa`) |
-| Sessão na rota | ⏳ falta o `get_session` + `Depends` |
+| Conexão + sessão (`db.py`) | ✅ `create_engine` + `get_session` |
+| Sessão na rota | ✅ `Depends(get_session)` em `create_user` e `read_users` |
+| Persistência de verdade | ✅ `POST /auth/create_users` grava; `GET /auth/users` lê |
+| Testes contra a rota | ✅ `dependency_overrides` troca o banco pelo SQLite em memória |
+| Senha | ⚠️ salva em **texto puro** — falta hash (próximo passo) |
 
-Ou seja: o **schema** do banco real já existe (foi o Alembic que o criou), mas a
-API **ainda não grava** nele — `create_user` só valida e devolve. O único lugar
-onde o SQLAlchemy realmente persiste dados hoje é a fixture `session` dos testes
-(SQLite em memória). Fechar esse elo é o próximo passo do estudo (ver seção 10).
+Ou seja: o que antes eram três peças isoladas (modelo, configuração e rota)
+agora está conectado por `db.py`. A API grava no `database.db` — cujo schema foi
+criado pelo Alembic — e os testes exercitam essa mesma rota apontando para um
+SQLite em memória, sem tocar no banco de desenvolvimento. O elo que falta agora
+é de **segurança**, não de encanamento (ver seção 10).
 
 ---
 
@@ -66,8 +71,13 @@ graph LR
     P6 --> P7["7<br/>Config<br/>settings.py"]
     P7 --> P8["8<br/>Testes<br/>conftest + test_*"]
     P8 --> P9["9<br/>Migrations<br/>Alembic"]
-    P9 --> P10["10<br/>Ligar rota<br/>ao banco ⏳"]
+    P9 --> P10["10<br/>Ligar rota<br/>ao banco ✅"]
+    P10 --> P11["11<br/>Hash de senha<br/>+ login ⏳"]
 ```
+
+> Os passos 1 a 10 estão **feitos** e cada um tem sua seção abaixo. O passo 11 é
+> o próximo da fila e está detalhado na
+> [seção 10 — próximos passos](#10-próximos-passos-sugeridos).
 
 ---
 
@@ -157,7 +167,7 @@ e-mail.
     '/create_users', status_code=HTTPStatus.CREATED, response_model=UserPublic
 )
 async def create_user(usuario_schema: UserSchema):
-    return usuario_schema
+    return usuario_schema      # nesta etapa ainda não havia banco
 ```
 
 **Lógica:** `UserPublic` é o `UserSchema` **sem `senha`**. Mesmo a função
@@ -166,6 +176,11 @@ devolvendo o objeto completo, o `response_model` faz o FastAPI serializar
 a senha — está no contrato.
 
 **Como sei que deu certo:** o 201 volta sem o campo `senha`.
+
+> No passo 10 esta mesma rota passa a devolver o objeto do **ORM** em vez do
+> schema de entrada. O `response_model` não muda — mas o `UserPublic` ganha os
+> `validation_alias`, porque os nomes das colunas são diferentes dos campos do
+> JSON.
 
 ---
 
@@ -290,21 +305,206 @@ uvx harlequin database.db     # SELECT * FROM users; e SELECT * FROM alembic_ver
 
 ---
 
-### Passo 10 — O passo que ainda falta: ligar a rota ao banco ⏳
+### Passo 10 — Ligar a rota ao banco ✅
 
-Hoje os passos 6 e 7 existem **isolados**: o `User` só é usado nos testes e
-nenhum `create_engine` lê o `Settings` (o único que lê é o `env.py` do Alembic).
-A tabela já existe no `database.db` — falta a API escrever nela. Fechar o ciclo é:
+**Problema:** até aqui os passos 6 e 7 viviam **isolados** — o `User` só era
+usado nos testes e nenhum `create_engine` lia o `Settings` (só o `env.py` do
+Alembic). A tabela já existia no `database.db`, mas a API não escrevia nela:
+`create_user` validava e devolvia o próprio payload.
 
-1. criar o módulo de conexão: `create_engine(Settings().DATABASE_URL)` +
-   `get_session()`;
-2. injetar na rota: `session: Session = Depends(get_session)`;
-3. converter `UserSchema` → `User`, `session.add()` + `commit()`;
-4. apagar a lista `database = []` (declarada e não usada);
-5. nos testes, `app.dependency_overrides[get_session]` para reaproveitar o
-   SQLite em memória.
+#### 10.1 — O módulo de conexão
 
-Detalhes e o que vem depois disso na [seção 10](#10-próximos-passos-sugeridos).
+**Arquivo:** [server/database/db.py](../server/database/db.py) *(novo)*
+
+```python
+engine = create_engine(Settings().DATABASE_URL)
+
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+```
+
+**Lógica:** a `engine` (o **pool de conexões**) é criada **uma vez**, quando o
+módulo é importado — abrir conexão por requisição seria caro. Já a `Session` é
+**por requisição**: ela guarda os objetos pendentes até o `commit`, então
+compartilhá-la entre requisições misturaria transações.
+
+O `yield` em vez de `return` é o detalhe importante: é ele que transforma a
+função em uma **dependência com teardown**. Tudo antes do `yield` é setup, tudo
+depois roda quando a resposta já saiu — e o `with` garante que a conexão volta
+ao pool mesmo se a rota levantar exceção.
+
+#### 10.2 — Injetar a sessão na rota (`Depends`)
+
+```python
+async def create_user(usuario_schema: UserSchema, session=Depends(get_session)):
+```
+
+**Lógica:** `Depends` é **injeção de dependência**. A rota não cria a Session,
+ela **pede** uma — e quem decide de onde ela vem é o FastAPI. Por isso a rota
+não sabe (nem precisa saber) se está falando com o `database.db` ou com um
+SQLite em memória; é exatamente essa indireção que torna o passo 10.5 possível.
+
+#### 10.3 — Gravar: schema → model → banco
+
+```python
+db_user = session.scalar(
+    select(User).where(User.user_email == usuario_schema.email)
+)
+if db_user:
+    raise HTTPException(
+        status_code=HTTPStatus.CONFLICT, detail='E-mail já cadastrado.'
+    )
+
+db_user = User(user_email=usuario_schema.email, ...)   # schema -> model
+session.add(db_user)        # marca como pendente (ainda não há SQL)
+session.commit()            # dispara o INSERT
+session.refresh(db_user)    # relê as colunas geradas pelo banco
+```
+
+**Lógica:** aqui acontece a **conversão** que o passo 6 já anunciava —
+`UserSchema` (contrato do cliente) vira `User` (linha da tabela), campo por
+campo, porque os nomes são diferentes de propósito.
+
+Três pontos que valem virar hábito:
+
+- **A checagem de e-mail duplicado é para dar erro BOM.** O `unique=True` da
+  coluna já impediria o registro repetido, mas o erro viria como uma exceção do
+  banco (`IntegrityError` → 500). Consultar antes permite responder **409
+  CONFLICT** com uma mensagem clara. O `unique` continua sendo a garantia final.
+- **`add()` não grava; `commit()` grava.** O `add` só coloca o objeto na fila da
+  sessão.
+- **`refresh()` traz de volta o que o BANCO gerou.** `user_id` e `created_at`
+  são `init=False` — não existem no objeto em memória até o banco preenchê-los.
+  Sem o `refresh`, o `id` da resposta não estaria disponível.
+
+#### 10.4 — Ler do ORM na resposta: os `validation_alias`
+
+**Problema novo:** agora a rota devolve um objeto do **SQLAlchemy**, não mais um
+schema Pydantic. E as colunas se chamam `user_email`, `user_name`, `user_time`,
+`user_id` — não `email`, `nome`, `time`, `id`.
+
+```python
+class UserPublic(BaseModel):
+    model_config = ConfigDict(from_attributes=True, validate_by_name=True)
+
+    id: int = Field(validation_alias='user_id')
+    email: EmailStr = Field(validation_alias='user_email')
+    nome: str = Field(validation_alias='user_name')
+    is_ativo: bool
+    is_admin: bool
+    time: str = Field(validation_alias='user_time')
+```
+
+**Lógica:** `from_attributes=True` autoriza o Pydantic a ler o objeto **por
+atributo** (`user.user_email`) em vez de por chave de dicionário. O
+`validation_alias` diz **de onde ler**; o nome do campo continua sendo o que
+aparece no JSON. Resultado: o banco mantém seus nomes prefixados e o cliente
+recebe `{'id': 1, 'email': ..., 'nome': ..., 'time': ...}`.
+
+`is_ativo` e `is_admin` não precisam de alias — coluna e campo têm o mesmo nome.
+
+> ### ⚠️ Armadilha que apareceu na prática
+>
+> O campo `id` foi declarado **sem** o alias:
+>
+> ```python
+> id: int          # Pydantic procura user.id -> não existe!
+> ```
+>
+> A resposta virou **500** com
+> `ResponseValidationError: ('response', 'id') Field required`.
+>
+> O que isso ensina: a validação do `response_model` acontece **depois** do
+> `commit()`. O usuário **foi gravado no banco** e o cliente recebeu erro — o
+> tipo de bug que faz parecer que "não salvou", quando salvou. Erro de
+> *resposta* é 500 (culpa do servidor); erro de *entrada* é 422 (culpa do
+> cliente).
+>
+> Correção: `id: int = Field(validation_alias='user_id')`.
+
+#### 10.5 — Listar usuários (`UserList`)
+
+```python
+@auth_router.get('/users', status_code=HTTPStatus.OK, response_model=UserList)
+def read_users(limit: int = 10, offset: int = 1, session=Depends(get_session)):
+    users = session.scalars(select(User).limit(limit).offset(offset)).all()
+    return {'users': users}
+```
+
+**Lógica:** `scalar()` (singular) devolve **um** objeto ou `None`; `scalars()`
+(plural) devolve um iterável, e o `.all()` o materializa em lista.
+
+`limit`/`offset` são só parâmetros com valor padrão — o FastAPI os expõe
+automaticamente como **query string** (`/auth/users?limit=5&offset=0`), porque
+não aparecem no caminho da rota.
+
+`UserList` envelopa a lista em `{'users': [...]}` em vez de devolver um array
+puro. Assim é possível somar `total`/`página` depois sem quebrar quem já
+consome a API.
+
+> ⚠️ O `offset` está com padrão **1**, então a primeira página pula o primeiro
+> usuário. O correto é `0` — anotado nos próximos passos.
+
+#### 10.6 — Fazer os testes usarem um banco descartável
+
+**Problema:** com a rota gravando de verdade, `test_create_user` passaria a
+escrever no banco de **desenvolvimento**.
+
+**Arquivo:** [test/conftest.py](../test/conftest.py)
+
+```python
+@pytest.fixture
+def client(session):
+    def get_session_override():
+        return session
+
+    with TestClient(app) as client:
+        app.dependency_overrides[get_session] = get_session_override
+        yield client
+
+    app.dependency_overrides.clear()
+```
+
+**Lógica:** `app.dependency_overrides` é o mecanismo oficial do FastAPI para
+**trocar uma dependência nos testes**. A chave é a função original
+(`get_session`); o valor é a substituta. Onde a rota pedir `Depends(get_session)`,
+recebe a Session em memória.
+
+- O override usa `return`, não `yield` — quem fecha a Session é a fixture
+  `session`.
+- O `.clear()` no fim é **obrigatório**: `dependency_overrides` vive no objeto
+  `app`, que é global. Sem limpar, o override vazaria para os testes seguintes.
+- `client` agora **declara `session` como parâmetro** — é isso que garante que o
+  banco em memória exista antes do client.
+
+E a engine de teste ganhou dois argumentos:
+
+```python
+engine = create_engine(
+    'sqlite:///:memory:',
+    connect_args={'check_same_thread': False},
+    poolclass=StaticPool,
+)
+```
+
+- **`StaticPool`** força o pool a reusar **sempre a mesma conexão**. Cada
+  conexão nova para `:memory:` abriria um banco **novo e vazio** — as tabelas
+  criadas pela fixture não existiriam para a rota (`no such table: users`).
+- **`check_same_thread=False`** porque o SQLite, por padrão, proíbe usar a
+  conexão fora da thread que a criou — e o `TestClient` roda o app em outra
+  thread.
+
+**Como sei que deu certo:**
+
+```bash
+uv run task test                      # 3 passed
+uvx harlequin database.db             # SELECT * FROM users; -> o registro está lá
+```
+
+E via `/docs`: `POST /auth/create_users` devolve 201 com `id`; repetir o mesmo
+e-mail devolve **409**; `GET /auth/users` lista o que foi gravado.
 
 ### Resumo dos passos em forma de tabela
 
@@ -319,7 +519,7 @@ Detalhes e o que vem depois disso na [seção 10](#10-próximos-passos-sugeridos
 | 7 | `settings.py` | *O que muda entre dev, teste e produção?* | Tudo o que é ambiente/segredo sai do código e vira variável validada pelo Pydantic. |
 | 8 | `conftest.py` | *Como testar sem depender do mundo real?* | Fixtures montam um cenário isolado — servidor falso, banco em memória e relógio congelado. |
 | 9 | `migrations/` | *Como o schema evolui sem perder dados?* | Cada mudança de tabela vira um arquivo versionado com `upgrade()`/`downgrade()`; o banco guarda em que revisão está. |
-| 10 | *(a fazer)* | *Como o dado sobrevive ao restart?* | `Depends(get_session)` na rota + `session.add/commit` — o elo que fecha o ciclo. |
+| 10 | `db.py` + `Depends` | *Como o dado sobrevive ao restart?* | A rota **pede** uma Session em vez de criar uma; `add`+`commit` gravam e o `response_model` traduz as colunas de volta para o JSON. |
 
 ---
 
@@ -334,8 +534,9 @@ graph TD
     subgraph "Aplicação FastAPI"
         M["server/main.py<br/>app = FastAPI()"]
         R["server/routes/auth_routes.py<br/>APIRouter (prefix /auth)"]
-        S["server/database/schemas.py<br/>Pydantic: UserSchema / UserPublic"]
+        S["server/database/schemas.py<br/>Pydantic: UserSchema /<br/>UserPublic / UserList"]
         MO["server/database/models.py<br/>SQLAlchemy: User"]
+        CN["server/database/db.py<br/>engine + get_session"]
         CFG["settings.py<br/>Settings (.env)"]
     end
 
@@ -352,20 +553,24 @@ graph TD
     C -->|requisição| M
     M -->|include_router| R
     R -->|valida entrada| S
-    R -->|resposta UserPublic| C
-    R -.->|FALTA: injetar session| MO
-    MO -->|hoje só é usado por| TDB
+    R -->|resposta UserPublic / UserList| C
+    R -->|Depends: pede a Session| CN
+    R -->|monta/lê objetos| MO
+    CN -->|abre conexão| DB
+    CN -.->|dependency_overrides nos testes| TDB
     MO -->|metadata comparado por| AL
+    CFG -->|DATABASE_URL| CN
     CFG -->|DATABASE_URL| AL
     AL --> VER
     VER -->|upgrade cria a tabela| DB
-    CFG -.->|FALTA: create_engine| DB
 ```
 
-> As setas **tracejadas** são o que ainda não existe no código. A rota
-> `create_user` apenas valida com `UserSchema` e devolve `UserPublic`;
-> `models.py` e `settings.py` estão prontos, mas quem os usa de verdade hoje é o
-> **Alembic** (que já criou a tabela `users` no `database.db`) — não a aplicação.
+> O ciclo está completo: `db.py` é a peça que uniu `settings.py` (a URL),
+> `models.py` (as tabelas) e as rotas. A única seta **tracejada** é a dos
+> testes — ela só existe quando o `app.dependency_overrides` substitui o
+> `get_session`, apontando as mesmas rotas para o SQLite em memória. O Alembic
+> continua num caminho paralelo: ele cuida do **schema**, a aplicação cuida dos
+> **dados**.
 
 ---
 
@@ -375,26 +580,43 @@ graph TD
 sequenceDiagram
     participant Cli as Cliente
     participant App as FastAPI (main)
+    participant Dep as get_session (db.py)
     participant Rt as auth_router
     participant In as UserSchema (Pydantic)
+    participant DB as Banco (SQLAlchemy)
     participant Out as UserPublic (Pydantic)
 
     Cli->>App: POST /auth/create_users (JSON)
-    App->>Rt: roteia para create_user()
-    Rt->>In: valida campos e tipos
+    App->>In: valida campos e tipos
     alt dados inválidos
         In-->>Cli: 422 Unprocessable Entity
     else dados válidos
-        In->>Rt: objeto validado
-        Rt->>Out: response_model remove a senha
-        Out-->>Cli: 201 CREATED (sem senha)
+        App->>Dep: resolve a dependência
+        Dep->>App: Session aberta
+        App->>Rt: chama create_user(schema, session)
+        Rt->>DB: SELECT ... WHERE user_email = ?
+        alt e-mail já existe
+            DB-->>Rt: usuário encontrado
+            Rt-->>Cli: 409 CONFLICT
+        else e-mail livre
+            Rt->>DB: add + commit (INSERT) + refresh
+            DB-->>Rt: User com user_id e created_at
+            Rt->>Out: response_model lê via validation_alias
+            Out-->>Cli: 201 CREATED (com id, sem senha)
+        end
+        Dep->>Dep: fecha a Session (pós-yield)
     end
 ```
 
-O ponto-chave: **entra `UserSchema` (com senha), sai `UserPublic` (sem senha)**.
-O `response_model=UserPublic` garante que a senha nunca vaza na resposta —
-mesmo que a função `create_user` devolva o objeto completo, o FastAPI serializa
-usando **apenas** os campos declarados em `UserPublic`.
+Três pontos-chave deste fluxo:
+
+1. **Entra `UserSchema` (com senha), sai `UserPublic` (sem senha).** A senha não
+   vaza porque o `response_model` serializa **apenas** os campos declarados.
+2. **A validação de entrada acontece antes da rota** (422 = culpa do cliente); a
+   do `response_model`, **depois do commit** (500 = culpa do servidor). Foi
+   exatamente aí que o bug do `id` sem alias apareceu.
+3. **A Session é fechada no fim**, no código que vem depois do `yield` do
+   `get_session` — inclusive se a rota tiver levantado o 409.
 
 ---
 
@@ -405,8 +627,9 @@ fastapi_1/
 ├── server/                     # código da aplicação
 │   ├── main.py                 # ponto de entrada: cria app e inclui routers
 │   ├── routes/
-│   │   └── auth_routes.py       # rotas /auth (home, create_users)
+│   │   └── auth_routes.py       # rotas /auth (home, create_users, users)
 │   └── database/
+│       ├── db.py                # engine + get_session (conexão com o banco)
 │       ├── models.py            # modelos ORM (tabela User)
 │       └── schemas.py           # schemas Pydantic (entrada/saída)
 ├── test/                       # testes automatizados
@@ -462,16 +685,40 @@ fastapi_1/
   O `prefix` evita repetir `/auth` em cada rota e a `tag` agrupa os endpoints
   na documentação automática (`/docs`).
 - `GET /auth/` → `home()`: retorna `{'mensagem': 'Olá mundo!'}` (status 200).
-- `POST /auth/create_users` → `create_user()`: recebe `UserSchema`, responde
-  `UserPublic` (status 201).
-- Ainda existe uma lista `database = []` no módulo, **declarada mas não usada** —
-  ela será substituída pela `session` do SQLAlchemy.
+- `POST /auth/create_users` → `create_user()`: recebe `UserSchema`, checa e-mail
+  duplicado (**409**), grava com `add`+`commit`+`refresh` e responde `UserPublic`
+  (status 201).
+- `GET /auth/users` → `read_users()`: lista paginada com `limit`/`offset` (query
+  string), responde `UserList` (status 200).
+- Ambas recebem a Session via `session=Depends(get_session)`.
+- A lista `database = []` continua no módulo, agora **totalmente sem uso** —
+  ficou como resquício da fase pré-banco e pode ser removida.
+
+### `server/database/db.py` — conexão com o banco
+- `engine = create_engine(Settings().DATABASE_URL)`: criada **uma vez** por
+  import; é o pool de conexões compartilhado pela aplicação.
+- `get_session()`: generator usado como dependência (`Depends`). Abre a
+  `Session`, entrega via `yield` e fecha depois da resposta.
+- É a peça que faltava para unir `settings.py` (URL), `models.py` (tabelas) e as
+  rotas. Também é o **ponto de substituição** nos testes, via
+  `app.dependency_overrides`.
 
 ### `server/database/schemas.py` — contratos Pydantic
 - `UserSchema` (**entrada**): email, nome, senha, is_ativo, is_admin, time.
-- `UserPublic` (**saída**): igual, mas **sem `senha`** → protege a senha.
+- `UserPublic` (**saída**): sem `senha` e com `id`. Usa
+  `ConfigDict(from_attributes=True)` para ler o objeto do ORM por atributo, e
+  `Field(validation_alias=...)` para mapear `user_id`/`user_email`/`user_name`/
+  `user_time` nos campos `id`/`email`/`nome`/`time` do JSON.
+- `UserList` (**saída da listagem**): envelopa a lista em `{'users': [...]}`.
+  Herda de `BaseModel` porque o FastAPI só aceita tipos Pydantic em
+  `response_model` — uma classe comum gera
+  `FastAPIError: Invalid args for response field!`.
 - `EmailStr` valida automaticamente se o email é válido (vem do extra
   `pydantic[email]`).
+
+> ⚠️ Cada campo cujo nome difere da coluna **precisa** do `validation_alias`.
+> Faltando um, o Pydantic não encontra o atributo no objeto do ORM e a API
+> responde **500** (`ResponseValidationError`) — depois de já ter gravado.
 
 ### `server/database/models.py` — modelo ORM
 - `User` mapeada para a tabela `users` via `@table_registry.mapped_as_dataclass`.
@@ -492,20 +739,31 @@ fastapi_1/
   `SettingsConfigDict(env_file='.env', env_file_encoding='utf-8')`.
 - Expõe `DATABASE_URL: str` — como não tem valor padrão, é **obrigatória**:
   faltando no `.env`, o Pydantic levanta erro de validação na inicialização.
+- É consumida em **dois lugares**: `server/database/db.py` (a engine da
+  aplicação) e `migrations/env.py` (a URL usada pelo Alembic).
 - O `.env` está no `.gitignore` (segredo não vai para o Git).
 
 ### `test/conftest.py` — fixtures do pytest
-- `client`: `TestClient(app)` para testar a API sem servidor real.
-- `session`: engine **SQLite em memória**, cria as tabelas (`create_all`),
-  entrega a `Session` via `yield` e derruba as tabelas (`drop_all`) no fim —
-  cada teste começa com um banco limpo.
+- `client(session)`: `TestClient(app)` já apontando para o banco de **teste**.
+  Registra `app.dependency_overrides[get_session]` para as rotas receberem a
+  Session em memória em vez da real, e chama `.clear()` no teardown — sem isso o
+  override vazaria para os outros testes, porque `app` é global.
+- `session`: engine **SQLite em memória** (com `StaticPool` e
+  `check_same_thread=False`, necessários para o TestClient ver as mesmas
+  tabelas), cria as tabelas (`create_all`), entrega a `Session` via `yield` e
+  derruba as tabelas (`drop_all`) no fim — cada teste começa com um banco limpo.
 - `_db_time_fake` / `return_mock`: context manager que registra um listener no
   evento `before_insert` do SQLAlchemy para forçar `created_at` com um valor
   fixo, deixando os testes de data/hora determinísticos.
 
 ### `test/test_app.py` — testes de integração (padrão AAA)
 - `test_home`: GET `/auth` → 200 + mensagem esperada.
-- `test_create_user`: POST `/auth/create_users` com payload válido → 201.
+- `test_create_user`: POST `/auth/create_users` com payload válido → 201. Como o
+  `client` aponta para o banco em memória, este teste hoje exercita a rota
+  **inteira** — validação, INSERT e serialização da resposta. Foi ele que acusou
+  o `id` sem `validation_alias` (500 em vez de 201).
+- Ainda sem cobertura: 409 de e-mail repetido, `GET /auth/users` e a conferência
+  do **corpo** da resposta do create (só o status é verificado).
 
 ### `test/test_db.py` — teste do ORM
 - Usa as fixtures `session` + `return_mock`.
@@ -677,12 +935,30 @@ duplicado. A ideia é que o próprio código sirva de material de revisão.
 ## 9. Conceitos aprendidos até aqui
 
 - **FastAPI**: `FastAPI()`, `APIRouter` com `prefix`/`tags`, rotas `async`,
-  `status_code` (via `http.HTTPStatus`) e `response_model`.
+  `status_code` (via `http.HTTPStatus`), `response_model`, `HTTPException` para
+  erros de negócio (409) e parâmetros com valor padrão virando **query string**
+  (`limit`/`offset`).
+- **Injeção de dependência**: `Depends(get_session)` — a rota **pede** o recurso
+  em vez de criá-lo. Dependência com `yield` = setup + teardown automáticos. E
+  `app.dependency_overrides` para substituí-la nos testes, o que só é possível
+  justamente porque a rota não sabe de onde o recurso vem.
 - **Pydantic**: modelos de entrada vs. saída, validação automática, `EmailStr`,
-  proteção de dados sensíveis via schema de resposta.
+  proteção de dados sensíveis via schema de resposta, `ConfigDict(
+  from_attributes=True)` para ler objetos do ORM e `Field(validation_alias=...)`
+  para traduzir nomes de coluna em nomes de campo do JSON.
+- **Onde cada erro nasce**: 422 = entrada inválida (antes da rota rodar); 409 =
+  conflito de regra de negócio (levantado por mim); 500
+  `ResponseValidationError` = o `response_model` não conseguiu ler o objeto
+  devolvido — e acontece **depois** do commit, então o dado já está no banco.
 - **SQLAlchemy 2.0**: API declarativa moderna (`Mapped`, `mapped_column`,
   `registry`, `mapped_as_dataclass`), PK autogerada, `unique`, `server_default`,
   `select()`, `session.add/commit/scalar` e eventos (`before_insert`).
+  Diferenças que importam: `add()` enfileira e `commit()` grava; `refresh()`
+  traz de volta o que o banco gerou (`user_id`, `created_at`); `scalar()`
+  devolve um objeto ou `None` e `scalars()` devolve vários (com `.all()`).
+  `engine` é criada uma vez (pool), `Session` é por requisição.
+- **SQLite em memória com TestClient**: `StaticPool` (senão cada conexão abre um
+  banco novo e vazio) + `check_same_thread=False` (o app roda em outra thread).
 - **Alembic**: `alembic init`, `revision --autogenerate`, `upgrade head`,
   `downgrade -1`, `current`/`heads`/`history`, a tabela `alembic_version` dentro
   do banco, a corrente `down_revision` e o papel do `target_metadata` no
@@ -709,7 +985,7 @@ duplicado. A ideia é que o próprio código sirva de material de revisão.
 ```mermaid
 graph LR
     A[Validar e devolver dados] --> M["Migrations com Alembic ✅"]
-    M --> B[Conectar rota ao banco]
+    M --> B["Conectar rota ao banco ✅"]
     B --> C[CRUD completo de usuário]
     C --> D[Hash de senha]
     D --> E[Login + JWT]
@@ -718,23 +994,34 @@ graph LR
 
 0. ~~**Migrations**: adotar **Alembic** para versionar o schema do banco.~~
    ✅ **feito** — tabela `users` criada pela revisão `3561799945aa` (passo 9).
-1. **Ligar `settings.py` ao SQLAlchemy**: criar um módulo de conexão com
-   `create_engine(Settings().DATABASE_URL)` e uma função `get_session()`. A
-   tabela já existe no `database.db`; falta a aplicação abrir a conexão.
-2. **Persistência real na rota**: injetar a `session` em `create_user` com
-   `Depends(get_session)` e gravar o usuário (removendo a lista `database = []`).
-   Nos testes, sobrescrever a dependência com
-   `app.dependency_overrides[get_session]` para reaproveitar o SQLite em memória.
-3. **CRUD**: listar, buscar por id, atualizar e deletar usuários.
-4. **Segurança**: nunca salvar senha em texto puro — usar hash (ex.: `pwdlib`/
-   `bcrypt`), validar email duplicado retornando 409/400. Cada mudança de coluna
-   daqui em diante passa a exigir uma **nova migration**
-   (`alembic revision --autogenerate`).
-5. **Autenticação**: endpoint de login que devolve **JWT** e rotas protegidas.
-6. **Testes**: completar `test/users/test_create_user.py` (email duplicado,
-   campos inválidos, senha ausente) e cobrir os erros 422.
-7. **Higiene do repo**: acrescentar `database.db` ao `.gitignore` — o banco é um
-   artefato local; a fonte da verdade do schema é `migrations/versions/`.
+1. ~~**Ligar `settings.py` ao SQLAlchemy**: módulo de conexão com
+   `create_engine(Settings().DATABASE_URL)` e `get_session()`.~~
+   ✅ **feito** — [server/database/db.py](../server/database/db.py) (passo 10.1).
+2. ~~**Persistência real na rota**: injetar a `session` com `Depends`, gravar o
+   usuário e, nos testes, usar `app.dependency_overrides[get_session]`.~~
+   ✅ **feito** — `create_user` grava e `read_users` lista (passo 10).
+
+**A fazer, em ordem de prioridade:**
+
+3. **Corrigir o `offset`**: o padrão é `1` em `read_users`, deveria ser `0` —
+   hoje a primeira página pula o primeiro usuário.
+4. **Segurança (o mais urgente)**: a senha está sendo salva em **texto puro** em
+   `user_password`. Usar hash (`pwdlib`/`argon2` ou `bcrypt`) na criação e nunca
+   guardar o valor original. Trocar o tamanho/nome da coluna daqui em diante
+   exige uma **nova migration** (`alembic revision --autogenerate`).
+5. **Completar o CRUD**: buscar por id (`GET /auth/users/{id}`), atualizar
+   (`PUT`/`PATCH`) e deletar (`DELETE`) — cada um com 404 quando o usuário não
+   existe.
+6. **Testes**: cobrir o **409** de e-mail duplicado, o `GET /auth/users` (lista
+   vazia e com dados), os erros **422** e o corpo das respostas — não só o
+   status. Preencher `test/users/test_create_user.py`, que segue só com o bloco
+   de documentação.
+7. **Limpeza**: remover a lista `database = []` de `auth_routes.py`, que ficou
+   sem uso depois do passo 10.
+8. **Autenticação**: endpoint de login que devolve **JWT** e rotas protegidas por
+   permissão (`is_admin`).
+9. **Fábrica de dados nos testes**: com mais casos, criar usuário na mão em cada
+   teste vira repetição — vale uma fixture/factory (ex.: `factory-boy`).
 
 <!--
 ========================= DOCUMENTAÇÃO DO ARQUIVO =========================
@@ -752,7 +1039,15 @@ Utilidade:
     migrations/env.py, a revisão 3561799945aa que cria a tabela users, os
     comandos upgrade/downgrade e a inspeção do banco com
     `uvx harlequin database.db`), cujo detalhamento completo vive em
-    migrations/GUIA-ALEMBIC.md. A seção 7 traz ainda o ciclo de trabalho com
+    migrations/GUIA-ALEMBIC.md. O passo 10 fecha o ciclo da API: o módulo de
+    conexão server/database/db.py (engine + get_session), a INJEÇÃO DE
+    DEPENDÊNCIA com Depends na rota, a gravação schema -> model -> banco
+    (add/commit/refresh) com 409 para e-mail duplicado, os validation_alias
+    do UserPublic para ler o objeto do ORM (e a armadilha do campo `id` sem
+    alias, que gera 500 ResponseValidationError DEPOIS do commit), a rota de
+    listagem com UserList + limit/offset e a troca do banco nos testes via
+    app.dependency_overrides (com StaticPool e check_same_thread=False).
+    A seção 7 traz ainda o ciclo de trabalho com
     git (branch -> format -> test -> commit -> merge), o padrão de mensagem de
     commit e a tabela de "voltar versão" (restore / amend / reset / revert /
     reflog), detalhados em docs/comandos-uv-task-ruff.md.

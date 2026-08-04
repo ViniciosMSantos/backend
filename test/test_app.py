@@ -67,18 +67,29 @@ def test_create_user(client):
 Utilidade:
     Testes de integração das rotas da API (camada HTTP). Sobem a aplicação
     via TestClient e validam status codes e respostas dos endpoints de
-    '/auth'. Seguem o padrão AAA (Arrange, Act, Assert).
+    '/auth'. Seguem o padrão AAA (Arrange, Act, Assert). Como o `client`
+    aponta para o SQLite em memória, estes testes exercitam a rota INTEIRA
+    — validação de entrada, gravação no banco e validação da resposta.
 
 Imports:
     - http.HTTPStatus: comparar os status codes esperados (OK, CREATED).
 
 Fixtures usadas (definidas em conftest.py):
-    - client: TestClient da API, injetado como argumento nos testes.
+    - client: TestClient da API com o banco de teste já injetado no lugar
+      do real (via app.dependency_overrides), injetado como argumento nos
+      testes.
 
 Funções:
     - test_home(client): garante que GET '/auth' retorna 200 e a mensagem
       {'mensagem': 'Olá mundo!'}.
     - test_create_user(client): garante que POST '/auth/create_users' com um
-      payload válido retorna 201 (CREATED).
+      payload válido retorna 201 (CREATED). Por passar pela rota completa,
+      é este teste que pega falhas do response_model — foi ele que acusou o
+      `UserPublic.id` sem validation_alias='user_id' (500, não 201).
+
+Cobertura ainda em aberto:
+    - POST com e-mail repetido (deve dar 409 CONFLICT).
+    - GET '/auth/users' (lista vazia e lista com usuários).
+    - Conferir o CORPO da resposta do create_user, não apenas o status.
 ==========================================================================
 """
