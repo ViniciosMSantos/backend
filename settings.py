@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     nunca contém segredos e é possível trocar de ambiente (dev, teste,
     produção) apenas trocando o `.env`.
     """
+
     model_config = SettingsConfigDict(
         env_file='.env', env_file_encoding='utf-8'
     )
@@ -19,6 +20,12 @@ class Settings(BaseSettings):
 
 """
 ========================= DOCUMENTAÇÃO DO ARQUIVO =========================
+Utilidade:
+    Centraliza a configuração da API. Lê e VALIDA as variáveis de ambiente
+    do arquivo `.env` (não versionado) na inicialização, seguindo o padrão
+    12-factor. É quem fornece a DATABASE_URL usada por
+    server/database/db.py para criar a engine, e também pelo Alembic nas
+    migrations — assim a URL do banco fica em um lugar só.
 
 Imports:
     - pydantic_settings.BaseSettings: classe base que lê variáveis de
